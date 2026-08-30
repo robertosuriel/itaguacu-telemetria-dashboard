@@ -1,0 +1,6 @@
+streamlit
+supabase
+pandas
+plotly
+python-dotenv
+streamlit-autorefresh
