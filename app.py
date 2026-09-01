@@ -58,6 +58,25 @@ COLOR_REAL = "#1baf7a"
 COLOR_TEORICA = "#2a78d6"
 
 
+def valid_id(value):
+    # usina.get("own_meter_device_id") vem null no banco pras 18 usinas sem medidor
+    # proprio. Localmente isso chega como None (bool(None) == False, tudo certo).
+    # Achado em 31/08: no Streamlit Cloud, trocar pra qualquer usina != Itaguaçu 7
+    # derrubava o app inteiro com um APIError vindo do Supabase — sintoma bate com
+    # esse campo sendo avaliado como "preenchido" quando nao devia (bool(nan) e
+    # True, por exemplo), fazendo o codigo tentar consultar leituras com um
+    # device_id invalido. Nao reproduziu local (mesma consulta, mesmo Python aqui
+    # retorna None normal) — possivelmente versao de lib diferente no Cloud (nada
+    # fixado no requirements.txt). Em vez de caçar a causa exata, blindamos aqui:
+    # trata None, NaN e string vazia igual, entao o resultado e sempre correto
+    # independente de qual forma o valor ausente chega.
+    if value is None:
+        return False
+    if isinstance(value, float) and pd.isna(value):
+        return False
+    return str(value).strip() != ""
+
+
 @st.cache_data(ttl=30)
 def load_usinas():
     res = supabase.table("usinas").select("*").order("slug").execute()
@@ -66,20 +85,25 @@ def load_usinas():
 
 @st.cache_data(ttl=15)
 def load_latest_reading(device_id):
-    if not device_id:
+    if not valid_id(device_id):
         return None
     # Ordena por created_at (confiavel, gerado pelo Postgres), nao por ts — uma
     # linha com ts contaminado/rotulado no futuro (residuo do bug de relogio do
     # PC industrial) apareceria como "a mais recente" se ordenasse por ts,
     # mesmo nao sendo de verdade a ultima leitura recebida.
-    res = (
-        supabase.table("readings")
-        .select("ts, metrics, created_at")
-        .eq("device_id", device_id)
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
-    )
+    try:
+        res = (
+            supabase.table("readings")
+            .select("ts, metrics, created_at")
+            .eq("device_id", device_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        # Nunca deixa uma consulta ruim (device_id invalido, rede, etc.) derrubar
+        # a pagina inteira — degrada pra "sem dado" nesse card especifico.
+        return None
     return res.data[0] if res.data else None
 
 
@@ -117,18 +141,21 @@ def load_teorica_dia(usina_id, day):
 
 @st.cache_data(ttl=30)
 def load_medidor_dia(device_id, day):
-    if not device_id:
+    if not valid_id(device_id):
         return pd.DataFrame()
     start, end = local_day_bounds_utc(day)
-    res = (
-        supabase.table("readings")
-        .select("ts, metrics")
-        .eq("device_id", device_id)
-        .gte("ts", start)
-        .lt("ts", end)
-        .order("ts")
-        .execute()
-    )
+    try:
+        res = (
+            supabase.table("readings")
+            .select("ts, metrics")
+            .eq("device_id", device_id)
+            .gte("ts", start)
+            .lt("ts", end)
+            .order("ts")
+            .execute()
+        )
+    except Exception:
+        return pd.DataFrame()
     rows = []
     for r in res.data:
         m = r.get("metrics") or {}
@@ -172,7 +199,7 @@ st.sidebar.caption(f"PR esperado: **{float(usina['pr_esperado'])*100:.0f}%**")
 st.sidebar.markdown("---")
 st.sidebar.caption(f"Atualiza a cada {REFRESH_MS // 1000}s")
 
-tem_medidor_proprio = bool(usina.get("own_meter_device_id"))
+tem_medidor_proprio = valid_id(usina.get("own_meter_device_id"))
 
 # ---------------- Header / KPIs ----------------
 st.title(f"☀️ {usina['name']}")
