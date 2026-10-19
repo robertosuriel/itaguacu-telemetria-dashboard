@@ -270,35 +270,40 @@ if not daily.empty:
     tem_teorica = "energia_teorica_kwh" in daily and daily["energia_teorica_kwh"].notna().any()
     total_real = daily["energia_real_kwh"].sum() if tem_real else None
     total_teorica = daily["energia_teorica_kwh"].sum() if tem_teorica else None
-    # PR do período = soma real / soma teórica (não a média dos PRs diários — isso
+    # Real ÷ meta = soma real / soma teórica (não a média dos índices diários — isso
     # pesaria dias de baixa geração igual a dias de alta, distorcendo o resultado).
-    pr_periodo = (total_real / total_teorica) if total_real is not None and total_teorica else None
+    # NÃO é o PR da usina: o PR-meta já está dentro da teórica; 100% = entregou o esperado.
+    real_div_meta = (total_real / total_teorica) if total_real is not None and total_teorica else None
+    pr_hoje = pr_meta(usina, pd.Timestamp.now())
 
     st.markdown(f"**Acumulado no período** ({start_date.strftime('%d/%m/%Y')} a {end_date.strftime('%d/%m/%Y')})")
     rc1, rc2, rc3 = st.columns(3)
-    rc1.metric("Real (Direta)", f"{total_real:,.0f} kWh".replace(",", ".") if total_real is not None else "—")
-    rc2.metric("Teórica (irradiância)", f"{total_teorica:,.0f} kWh".replace(",", ".") if total_teorica is not None else "—")
-    rc3.metric("PR do período", f"{pr_periodo * 100:.1f}%" if pr_periodo is not None else "—")
+    rc1.metric("Real (medidor)", f"{total_real:,.0f} kWh".replace(",", ".") if total_real is not None else "—",
+               help="Energia injetada medida pelo medidor da usina (Direta).")
+    rc2.metric("Meta (teórica)", f"{total_teorica:,.0f} kWh".replace(",", ".") if total_teorica is not None else "—",
+               help=f"Irradiância da estação × kWp × PR-meta ({pr_hoje * 100:.0f}%), limitada ao teto de potência.")
+    rc3.metric("Real ÷ meta", f"{real_div_meta * 100:.1f}%" if real_div_meta is not None else "—",
+               help="Geração real dividida pela meta. 100% = a usina entregou o esperado. Não é o PR da usina: o PR-meta já está dentro da meta.")
 
 fig1 = go.Figure()
 if not daily.empty:
     daily["dia"] = pd.to_datetime(daily["dia"])
     if "energia_real_kwh" in daily and daily["energia_real_kwh"].notna().any():
-        fig1.add_trace(go.Bar(x=daily["dia"], y=daily["energia_real_kwh"], name="Real (Direta)", marker_color=COLOR_REAL))
+        fig1.add_trace(go.Bar(x=daily["dia"], y=daily["energia_real_kwh"], name="Real (medidor)", marker_color=COLOR_REAL))
     if "energia_teorica_kwh" in daily and daily["energia_teorica_kwh"].notna().any():
-        fig1.add_trace(go.Scatter(x=daily["dia"], y=daily["energia_teorica_kwh"], name="Teórica (irradiância)", line=dict(color=COLOR_TEORICA, width=2)))
+        fig1.add_trace(go.Scatter(x=daily["dia"], y=daily["energia_teorica_kwh"], name="Meta (teórica)", line=dict(color=COLOR_TEORICA, width=2)))
     fig1.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="kWh", legend=dict(orientation="h", y=1.1))
     st.plotly_chart(fig1, use_container_width=True)
     st.download_button(
         "⬇️ Exportar CSV (energia diária do período)",
-        data=daily.to_csv(index=False).encode("utf-8"),
+        data=daily.rename(columns={"pr_observado": "real_div_meta"}).to_csv(index=False).encode("utf-8"),
         file_name=f"energia_diaria_{usina['slug']}_{start_date}_a_{end_date}.csv",
         mime="text/csv",
     )
 else:
     st.info("Sem dados de energia diária nesse período.")
 
-st.caption("⚠️ Energia teórica pode estar subcontada em dias com falha de comunicação com a estação (janelas de irradiância faltando). O PR do período usa soma real / soma teórica, não a média dos PRs diários.")
+st.caption("⚠️ A meta (teórica) pode estar subcontada em dias com falha de comunicação com a estação (janelas de irradiância faltando) ou com sombra no sensor de irradiância. \"Real ÷ meta\" usa soma real / soma da meta no período, não a média dos dias.")
 
 st.markdown("---")
 
@@ -330,10 +335,10 @@ st.subheader("2. Potência ao longo do dia (kW)")
 fig2 = go.Figure()
 if not teorica_dia.empty:
     t2 = com_buracos(teorica_dia, ["potencia_teorica_kw"])
-    fig2.add_trace(go.Scatter(x=t2["ts"], y=t2["potencia_teorica_kw"], name="Estação (teórica)", line=dict(color=COLOR_TEORICA, width=2)))
+    fig2.add_trace(go.Scatter(x=t2["ts"], y=t2["potencia_teorica_kw"], name="Meta (teórica)", line=dict(color=COLOR_TEORICA, width=2)))
 if not medidor_dia.empty and medidor_dia["potencia_real_kw"].notna().any():
     m2 = com_buracos(medidor_dia, ["potencia_real_kw"])
-    fig2.add_trace(go.Scatter(x=m2["ts"], y=m2["potencia_real_kw"], name="Medidor (P3f)", line=dict(color=COLOR_REAL, width=2)))
+    fig2.add_trace(go.Scatter(x=m2["ts"], y=m2["potencia_real_kw"], name="Real (medidor)", line=dict(color=COLOR_REAL, width=2)))
 if teorica_dia.empty and medidor_dia.empty:
     st.info("Sem dados de potência para esse dia.")
 else:
@@ -354,7 +359,7 @@ if not teorica_dia.empty:
         teorica_dia_sorted["potencia_teorica_kw"].astype(float) * (teorica_dia_sorted["duracao_s"].astype(float) / 3600)
     ).cumsum()
     t3 = com_buracos(teorica_dia_sorted, ["energia_acumulada_kwh"])
-    fig3.add_trace(go.Scatter(x=t3["ts"], y=t3["energia_acumulada_kwh"], name="Estação (teórica, acumulada)", line=dict(color=COLOR_TEORICA, width=2)))
+    fig3.add_trace(go.Scatter(x=t3["ts"], y=t3["energia_acumulada_kwh"], name="Meta (teórica, acumulada)", line=dict(color=COLOR_TEORICA, width=2)))
     has_data3 = True
 
 if not medidor_dia.empty and medidor_dia["direta_kwh"].notna().any():
@@ -364,7 +369,7 @@ if not medidor_dia.empty and medidor_dia["direta_kwh"].notna().any():
     baseline = medidor_dia_sorted["direta_kwh"].iloc[0]
     medidor_dia_sorted["energia_acumulada_kwh"] = medidor_dia_sorted["direta_kwh"] - baseline
     m3 = com_buracos(medidor_dia_sorted, ["energia_acumulada_kwh"])
-    fig3.add_trace(go.Scatter(x=m3["ts"], y=m3["energia_acumulada_kwh"], name="Medidor (Direta, acumulado no dia)", line=dict(color=COLOR_REAL, width=2)))
+    fig3.add_trace(go.Scatter(x=m3["ts"], y=m3["energia_acumulada_kwh"], name="Real (medidor, acumulado no dia)", line=dict(color=COLOR_REAL, width=2)))
     has_data3 = True
 
 if has_data3:
