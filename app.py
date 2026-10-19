@@ -126,7 +126,7 @@ def load_teorica_dia(usina_id, day):
     start, end = local_day_bounds_utc(day)
     res = (
         supabase.table("v_geracao_teorica")
-        .select("ts, potencia_teorica_kw")
+        .select("ts, potencia_teorica_kw, duracao_s")
         .eq("usina_id", usina_id)
         .gte("ts", start)
         .lt("ts", end)
@@ -192,10 +192,27 @@ default_idx = int(usinas_df.index[usinas_df["slug"] == "itaguacu-7"][0])
 usina_label = st.sidebar.selectbox("Usina", usinas_df["label"], index=default_idx)
 usina = usinas_df[usinas_df["label"] == usina_label].iloc[0]
 
+def pr_meta(usina, quando):
+    # Mesma conta da v_geracao_teorica: PR na data base, degradando degradacao_anual
+    # por ano a partir dela. Sem data base ou sem degradacao = pr_esperado fixo
+    # (e o caso das usinas que nao foram calibradas, e do banco antes da migracao).
+    base = float(usina["pr_esperado"])
+    data_base, deg = usina.get("pr_data_base"), usina.get("degradacao_anual")
+    if not data_base or pd.isna(data_base) or not deg or pd.isna(deg) or float(deg) == 0:
+        return base
+    anos = (pd.Timestamp(quando).tz_localize(None) - pd.Timestamp(data_base)).days / 365.25
+    return base * (1 - float(deg)) ** anos
+
+
+def teto_kw(usina):
+    teto = usina.get("teto_medido_kw")
+    return float(teto) if teto is not None and not pd.isna(teto) else float(usina["corte_kw"])
+
+
 st.sidebar.markdown("---")
 st.sidebar.caption(f"kWp instalado: **{usina['kwp_instalado']}**")
-st.sidebar.caption(f"Corte de injeção: **{usina['corte_kw']} kW**")
-st.sidebar.caption(f"PR esperado: **{float(usina['pr_esperado'])*100:.0f}%**")
+st.sidebar.caption(f"Teto de potência: **{teto_kw(usina):.1f} kW** (corte de injeção {usina['corte_kw']} kW)")
+st.sidebar.caption(f"PR-meta hoje: **{pr_meta(usina, pd.Timestamp.now()) * 100:.1f}%**")
 st.sidebar.markdown("---")
 st.sidebar.caption(f"Atualiza a cada {REFRESH_MS // 1000}s")
 
@@ -226,7 +243,7 @@ else:
     col3.metric("Direta acumulada", "—")
 
 if irr is not None:
-    p_teorica = min((irr / 1000) * float(usina["kwp_instalado"]) * float(usina["pr_esperado"]), float(usina["corte_kw"]))
+    p_teorica = min((irr / 1000) * float(usina["kwp_instalado"]) * pr_meta(usina, pd.Timestamp.now()), teto_kw(usina))
     col4.metric("Potência teórica (agora)", f"{p_teorica:.1f} kW")
 else:
     col4.metric("Potência teórica (agora)", "—")
@@ -291,14 +308,32 @@ dia_unico = st.date_input("Dia (gráficos 2 e 3)", value=date.today(), key="dia_
 teorica_dia = load_teorica_dia(usina["id"], dia_unico)
 medidor_dia = load_medidor_dia(usina.get("own_meter_device_id"), dia_unico) if tem_medidor_proprio else pd.DataFrame()
 
+GAP_MAX = pd.Timedelta(minutes=15)
+
+
+def com_buracos(df, cols):
+    # Insere uma linha vazia onde faltam dados por mais de GAP_MAX: o Plotly interrompe
+    # a linha ali, em vez de ligar os pontos e fazer parecer que houve dado (ex.: queda
+    # de energia na usina em 18/10/2026, 15:54-20:03). So pra desenhar, nao pro CSV.
+    df = df.sort_values("ts")
+    gaps = df["ts"].diff() > GAP_MAX
+    if not gaps.any():
+        return df
+    vazias = pd.DataFrame({"ts": df.loc[gaps, "ts"] - GAP_MAX / 2})
+    for c in cols:
+        vazias[c] = None
+    return pd.concat([df, vazias]).sort_values("ts")
+
 # ================= Gráfico 2 — Potência a cada 5min (kW) =================
 st.subheader("2. Potência ao longo do dia (kW)")
 
 fig2 = go.Figure()
 if not teorica_dia.empty:
-    fig2.add_trace(go.Scatter(x=teorica_dia["ts"], y=teorica_dia["potencia_teorica_kw"], name="Estação (teórica)", line=dict(color=COLOR_TEORICA, width=2)))
+    t2 = com_buracos(teorica_dia, ["potencia_teorica_kw"])
+    fig2.add_trace(go.Scatter(x=t2["ts"], y=t2["potencia_teorica_kw"], name="Estação (teórica)", line=dict(color=COLOR_TEORICA, width=2)))
 if not medidor_dia.empty and medidor_dia["potencia_real_kw"].notna().any():
-    fig2.add_trace(go.Scatter(x=medidor_dia["ts"], y=medidor_dia["potencia_real_kw"], name="Medidor (P3f)", line=dict(color=COLOR_REAL, width=2)))
+    m2 = com_buracos(medidor_dia, ["potencia_real_kw"])
+    fig2.add_trace(go.Scatter(x=m2["ts"], y=m2["potencia_real_kw"], name="Medidor (P3f)", line=dict(color=COLOR_REAL, width=2)))
 if teorica_dia.empty and medidor_dia.empty:
     st.info("Sem dados de potência para esse dia.")
 else:
@@ -313,8 +348,13 @@ has_data3 = False
 
 if not teorica_dia.empty:
     teorica_dia_sorted = teorica_dia.sort_values("ts").copy()
-    teorica_dia_sorted["energia_acumulada_kwh"] = (teorica_dia_sorted["potencia_teorica_kw"] * (300 / 3600)).cumsum()
-    fig3.add_trace(go.Scatter(x=teorica_dia_sorted["ts"], y=teorica_dia_sorted["energia_acumulada_kwh"], name="Estação (teórica, acumulada)", line=dict(color=COLOR_TEORICA, width=2)))
+    # duracao_s = tempo real da janela (~313 s no gateway, nao 300) — mesma conta da
+    # v_geracao_teorica_diaria, pra acumulada do dia fechar com a teorica diaria.
+    teorica_dia_sorted["energia_acumulada_kwh"] = (
+        teorica_dia_sorted["potencia_teorica_kw"].astype(float) * (teorica_dia_sorted["duracao_s"].astype(float) / 3600)
+    ).cumsum()
+    t3 = com_buracos(teorica_dia_sorted, ["energia_acumulada_kwh"])
+    fig3.add_trace(go.Scatter(x=t3["ts"], y=t3["energia_acumulada_kwh"], name="Estação (teórica, acumulada)", line=dict(color=COLOR_TEORICA, width=2)))
     has_data3 = True
 
 if not medidor_dia.empty and medidor_dia["direta_kwh"].notna().any():
@@ -323,7 +363,8 @@ if not medidor_dia.empty and medidor_dia["direta_kwh"].notna().any():
     # com a teorica (que comeca em 0 as 00:00), subtrai a primeira leitura do dia.
     baseline = medidor_dia_sorted["direta_kwh"].iloc[0]
     medidor_dia_sorted["energia_acumulada_kwh"] = medidor_dia_sorted["direta_kwh"] - baseline
-    fig3.add_trace(go.Scatter(x=medidor_dia_sorted["ts"], y=medidor_dia_sorted["energia_acumulada_kwh"], name="Medidor (Direta, acumulado no dia)", line=dict(color=COLOR_REAL, width=2)))
+    m3 = com_buracos(medidor_dia_sorted, ["energia_acumulada_kwh"])
+    fig3.add_trace(go.Scatter(x=m3["ts"], y=m3["energia_acumulada_kwh"], name="Medidor (Direta, acumulado no dia)", line=dict(color=COLOR_REAL, width=2)))
     has_data3 = True
 
 if has_data3:
